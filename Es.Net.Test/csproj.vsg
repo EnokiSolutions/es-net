@@ -1,0 +1,8 @@
+{
+  "refs":[
+  "Es.Server",
+  "nunit.framework",
+  "System",
+  "System.Core"
+  ]
+}
