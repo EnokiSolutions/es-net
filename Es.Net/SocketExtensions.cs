@@ -34,5 +34,14 @@ namespace Es.Net
                 awaitable.WasCompleted = true;
             return awaitable;
         }
+
+        public static SocketAwaitable DisconnectAsync(this Socket socket, SocketAwaitable awaitable)
+        {
+            awaitable.Reset();
+            if (!socket.DisconnectAsync(awaitable.EventArgs))
+                awaitable.WasCompleted = true;
+            return awaitable;
+        }
+
     }
 }

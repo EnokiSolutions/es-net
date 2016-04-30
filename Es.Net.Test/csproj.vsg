@@ -1,6 +1,8 @@
 {
   "refs":[
-  "Es.Server",
+  "Es.FwI",
+  "Es.Fw",
+  "Es.Net",
   "nunit.framework",
   "System",
   "System.Core"

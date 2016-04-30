@@ -6,42 +6,52 @@ using System.Threading.Tasks;
 
 namespace Es.Net
 {
-    internal sealed class SocketAwaitable : INotifyCompletion
+    public sealed class SocketAwaitable : INotifyCompletion, IDisposable
     {
-        private static readonly Action Sentinel = () => { };
+        private static readonly Action Completed = () => { };
 
         internal bool WasCompleted;
-        internal Action Continuation;
+        private Action _continuation;
         internal SocketAsyncEventArgs EventArgs { get; }
-
+        private CancellationTokenRegistration _ctr;
         private bool _cancelled;
-        private CancellationTokenRegistration _reg;
 
         public SocketAwaitable(SocketAsyncEventArgs eventArgs, CancellationToken token)
         {
-            if (eventArgs == null) throw new ArgumentNullException(nameof(eventArgs));
+            if (eventArgs == null)
+                throw new ArgumentNullException(nameof(eventArgs));
+
             EventArgs = eventArgs;
 
-            eventArgs.Completed += OnEventArgsOnCompleted;
-
-            _reg = token.Register(() =>
+            _ctr = token.Register(() =>
             {
                 _cancelled = true;
                 OnEventArgsOnCompleted(null, null);
-                _reg.Dispose();
             });
+
+            eventArgs.Completed += OnEventArgsOnCompleted;
         }
 
         private void OnEventArgsOnCompleted(object sender, SocketAsyncEventArgs args)
         {
-            var prev = Continuation ?? Interlocked.CompareExchange(ref Continuation, Sentinel, null);
-            prev?.Invoke();
+            var prev = Interlocked.CompareExchange(ref _continuation, Completed, null); // returns the original value at _continuation
+
+            if (prev == null || prev == Completed)
+                return;
+
+            var originalValue = _continuation;
+            prev = Interlocked.CompareExchange(ref _continuation, Completed, originalValue); // force to Completed
+            if (prev == originalValue) // if we failed someone else already forced it.
+                prev?.Invoke(); // otherwise we are the only one to latch onto the continuation callback, so call it.
         }
 
         internal void Reset()
         {
+            if (_cancelled)
+                throw new TaskCanceledException();
+
             WasCompleted = false;
-            Continuation = null;
+            _continuation = null;
         }
 
         public SocketAwaitable GetAwaiter() { return this; }
@@ -50,11 +60,12 @@ namespace Es.Net
 
         public void OnCompleted(Action continuation)
         {
-            if (Continuation == Sentinel ||
-                Interlocked.CompareExchange(
-                    ref Continuation, continuation, null) == Sentinel)
+            if (_continuation == Completed  // we've completed
+                || Interlocked.CompareExchange(ref _continuation, continuation, null) == Completed // we failed to translation from null -> continuation because OnEventArgsOnComplete run
+                )
             {
-                Task.Run(continuation);
+                // task is done already, continue.
+                continuation();
             }
         }
 
@@ -65,6 +76,11 @@ namespace Es.Net
 
             if (EventArgs.SocketError != SocketError.Success)
                 throw new SocketException((int)EventArgs.SocketError);
+        }
+
+        public void Dispose()
+        {
+            _ctr.Dispose();
         }
     }
 }

@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -9,20 +12,40 @@ namespace Es.Net
 {
     internal sealed class ServiceRequestServer : IServer
     {
-        private readonly ushort _port;
-        private readonly IDictionary<string, IServiceCallHandler> _handlerMapping;
-        private readonly IPAddress _ip;
-        private readonly Action<string> _log;
         private const int ListenBacklogSize = 256;
         private const int BufferSize = 1024*128;
         private const int MaxRequestSize = 1024*1024;
 
-        public ServiceRequestServer(IPAddress ip, ushort port, IDictionary<string, IServiceCallHandler> handlerMapping, Action<string> log)
+        private static readonly byte[] ContentLengthUpper =
+        {
+            0x43, 0x4F, 0x4E, 0x54, 0x45, 0x4E, 0x54, 0x2D, 0x4C, 0x45,
+            0x4E, 0x47, 0x54, 0x48
+        };
+
+        private static readonly byte[] ContentLengthLower =
+        {
+            0x63, 0x6F, 0x6E, 0x74, 0x65, 0x6E, 0x74, 0x2D, 0x6C, 0x65,
+            0x6E, 0x67, 0x74, 0x68
+        };
+
+        // Bare minimum of http/1.1 (this isn't a general http server, we're abusing HTTP to get across firewalls and assume the client is one of ours.) 
+        // we assume keep-alive
+
+        private static readonly byte[] BadRequest = Encoding.UTF8.GetBytes("400 BAD REQUEST\r\n");
+
+        private static readonly bool IsLittle = BitConverter.IsLittleEndian;
+        private readonly IDictionary<ulong, IServiceCallHandler> _handlerMapping;
+        private readonly IPAddress _ip;
+        private readonly Action<string> _log;
+        private readonly ushort _port;
+
+        public ServiceRequestServer(IPAddress ip, ushort port, IDictionary<ulong, IServiceCallHandler> handlerMapping,
+            Action<string> log)
         {
             _ip = ip;
             _port = port;
             _handlerMapping = handlerMapping;
-            _log = log ?? (_=>{});
+            _log = log ?? (_ => { });
         }
 
         public async Task Run(CancellationToken token)
@@ -31,60 +54,66 @@ namespace Es.Net
             var awaitable = new SocketAwaitable(socketAsyncEventArgs, token);
             while (!token.IsCancellationRequested)
             {
-                var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.IPv4)
-                {
-                    Blocking = false,
-                    NoDelay = true,
-                    SendTimeout = 1000,
-                    ReceiveTimeout = 1000
-                };
-
-                s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, 1);
-                var bindEndpoint = new IPEndPoint(_ip, _port);
-                s.Bind(bindEndpoint);
-                s.Listen(ListenBacklogSize);
-
                 try
                 {
+                    var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                    
+                    s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, 1);
+                    var bindEndpoint = new IPEndPoint(_ip, _port);
+                    s.Bind(bindEndpoint);
+                    s.Listen(ListenBacklogSize);
+
                     while (!token.IsCancellationRequested)
                     {
-                        await s.AcceptAsync(awaitable);
-                        HandleConnection(socketAsyncEventArgs.AcceptSocket, token);
+                        try
+                        {
+                            await s.AcceptAsync(awaitable);
+
+                            HandleConnection(socketAsyncEventArgs.AcceptSocket, token);
+                            socketAsyncEventArgs.AcceptSocket = null;
+                        }
+                        catch (Exception ex)
+                        {
+                            _log($"{ex}");
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
                     _log($"{ex}");
+                    throw;
                 }
             }
         }
 
-        private static readonly byte[] _contentLengthUpper = { 0x43, 0x4F, 0x4E, 0x54, 0x45, 0x4E, 0x54, 0x2D, 0x4C, 0x45, 0x4E, 0x47, 0x54, 0x48 };
-        private static readonly byte[] _contentLengthLower = { 0x63, 0x6F, 0x6E, 0x74, 0x65, 0x6E, 0x74, 0x2D, 0x6C, 0x65, 0x6E, 0x67, 0x74, 0x68 };
-
         private async void HandleConnection(Socket remoteSocket, CancellationToken token)
         {
-            var args = new SocketAsyncEventArgs();
+            var recvArgs = new SocketAsyncEventArgs();
             var buffer = new byte[BufferSize];
-            args.SetBuffer(buffer, 0, buffer.Length);
-            var awaitable = new SocketAwaitable(args, token);
+            recvArgs.SetBuffer(buffer, 0, buffer.Length);
+            var recvAwaitable = new SocketAwaitable(recvArgs, token);
 
-            var requestBuffer = new byte[MaxRequestSize*2];
+            var sendArgs = new SocketAsyncEventArgs();
+            var sendAwaitable = new SocketAwaitable(sendArgs, token);
+
+            var requestBuffer = new byte[2*MaxRequestSize];
 
             var requestBufferUsed = 0;
+            var contentLength = -1;
             var eohi = 0;
+            var eori = 0;
             var endOfHeadersFound = false;
 
-            while(!token.IsCancellationRequested)
+            while (!token.IsCancellationRequested)
             {
-                await remoteSocket.ReceiveAsync(awaitable);
+                await remoteSocket.ReceiveAsync(recvAwaitable);
 
-                var n = args.BytesTransferred;
+                var n = recvArgs.BytesTransferred;
                 if (n == 0)
                 {
                     // client hung up
                     remoteSocket.Close();
-                    break; 
+                    break;
                 }
 
                 // each request MUST match: POST / HTTP/1.1\r\nHost: ...\r\nContent-Length: 0\r\n\r\nDATA
@@ -92,15 +121,15 @@ namespace Es.Net
                 //
                 // so we need at least 50 bytes of data before we even bother looking, and we can skip over 40 chars in the initial search
 
-                Buffer.BlockCopy(args.Buffer, 0, requestBuffer, requestBufferUsed, n);
+                Buffer.BlockCopy(recvArgs.Buffer, 0, requestBuffer, requestBufferUsed, n);
                 requestBufferUsed += n;
 
                 if (!endOfHeadersFound)
-                { 
+                {
                     // first packet of data, and it's large enough it might have the entire header payload already
                     // search for \r\n\r\n (end of headers)
-
-                    while (eohi < requestBufferUsed - 4)
+                    var tmp = Encoding.UTF8.GetString(requestBuffer, 0, requestBufferUsed);
+                    while (eohi <= requestBufferUsed - 4)
                     {
                         if (requestBuffer[eohi] == '\r'
                             && requestBuffer[eohi + 1] == '\n'
@@ -117,54 +146,121 @@ namespace Es.Net
                     {
                         continue; // get more data before continuing
                     }
+                    // find the content-length
+                    // start at hn and go backwards
+                    var xi = eohi;
 
+                    while (xi > ContentLengthLower.Length + 1)
                     {
-                        // find the content-length
-                        // start at hn and go backwards
-                        var xi = eohi - 4;
-                        var contentLength = -1;
-
-                        while (xi > _contentLengthLower.Length + 1)
+                        if (requestBuffer[xi] == ':')
                         {
-                            if (requestBuffer[xi] == ':')
+                            var yi = xi - ContentLengthLower.Length;
+                            var foundContentLength = true;
+
+                            for (var i = 0; i < ContentLengthLower.Length; ++i)
                             {
-                                var yi = xi - 1 - _contentLengthLower.Length;
-                                var foundContentLength = true;
-
-                                for (var i = 0; i < _contentLengthLower.Length; ++i)
-                                {
-                                    if (requestBuffer[yi] == _contentLengthLower[i]
-                                        || requestBuffer[yi] == _contentLengthUpper[i]) continue;
-                                    foundContentLength = false;
-                                    break;
-                                }
-
-                                if (foundContentLength)
-                                {
-                                    contentLength = 0;
-                                    ++xi;
-                                    while (requestBuffer[xi] == ' ') ++xi;
-                                    while (char.IsDigit((char) requestBuffer[xi]))
-                                    {
-                                        contentLength = contentLength*10 + requestBuffer[xi] - '0';
-                                        ++xi;
-                                    }
-                                    break;
-                                }
+                                var c = requestBuffer[yi+i];
+                                if (c == ContentLengthLower[i] || c == ContentLengthUpper[i])
+                                    continue;
+                                foundContentLength = false;
+                                break;
                             }
-                            --xi;
-                        }
 
-                        if (contentLength < 0) // invalid request
+                            if (foundContentLength)
+                            {
+                                contentLength = 0;
+                                ++xi;
+                                while (requestBuffer[xi] == ' ') ++xi;
+                                while (char.IsDigit((char) requestBuffer[xi]))
+                                {
+                                    contentLength = contentLength*10 + requestBuffer[xi] - '0';
+                                    ++xi;
+                                }
+                                break;
+                            }
+                        }
+                        --xi;
+                    }
+
+                    if (contentLength < 8) // invalid request, need at least 8 bytes so we can map to a handler.
+                    {
+                        remoteSocket.Shutdown(SocketShutdown.Both);
+                        remoteSocket.Close();
+                        break;
+                    }
+                    // we expect contentLength bytes after eohi (last byte of headers) + 4 (\r\n\r\n after the headers)
+                    eori = eohi + 4 + contentLength;
+                }
+
+                if (n >= eori)
+                {
+                    var offset = eohi + 4;
+
+                    ulong shid;
+
+                    unsafe
+                    {
+                        fixed (byte* b = &requestBuffer[offset])
                         {
-                            remoteSocket.Shutdown(SocketShutdown.Both);
-                            remoteSocket.Close();
-                            break;
+                            shid = LoadULong(b);
                         }
                     }
 
+                    IServiceCallHandler sh;
+                    if (!_handlerMapping.TryGetValue(shid, out sh))
+                    {
+                        sendArgs.SetBuffer(BadRequest, 0, BadRequest.Length);
+                        await remoteSocket.SendAsync(sendAwaitable);
+                        remoteSocket.Close();
+                        return;
+                    }
+
+                    var bufferList = new List<ArraySegment<byte>>();
+                    var headers = new ArraySegment<byte>();
+                    bufferList.Add(headers);
+
+                    await sh.Handle(bufferList, token, requestBuffer, offset + 8, contentLength - 8);
+
+                    var responseContentLength = bufferList.Skip(1).Sum(x => x.Count);
+                    var headerBytes = Encoding.UTF8.GetBytes($"200 OK\r\nContent-Type: binary\r\nContent-Length: {responseContentLength}\r\n");
+                    bufferList[0] = new ArraySegment<byte>(headerBytes);
+                    sendArgs.BufferList = bufferList;
+
+                    await remoteSocket.SendAsync(sendAwaitable);
+
+                    requestBufferUsed = n - offset - contentLength;
+                    if (requestBufferUsed != 0)
+                    {
+                        Buffer.BlockCopy(requestBuffer, eori, requestBuffer, 0, requestBufferUsed);
+                    }
+                    contentLength = -1;
+                    eohi = 0;
+                    eori = 0;
+                    endOfHeadersFound = false;
                 }
             }
+        }
+
+        [ExcludeFromCodeCoverage]
+        private static unsafe ulong LoadULong(byte* source)
+        {
+            if (IsLittle)
+                return source[0]
+                       | ((ulong) source[1] << 8)
+                       | ((ulong) source[2] << 16)
+                       | ((ulong) source[3] << 24)
+                       | ((ulong) source[4] << 32)
+                       | ((ulong) source[5] << 40)
+                       | ((ulong) source[6] << 48)
+                       | ((ulong) source[7] << 56);
+            return ((ulong) source[0] << 56)
+                   | ((ulong) source[1] << 48)
+                   | ((ulong) source[2] << 40)
+                   | ((ulong) source[3] << 32)
+                   | ((ulong) source[4] << 24)
+                   | ((ulong) source[5] << 16)
+                   | ((ulong) source[6] << 8)
+                   | source[7];
         }
     }
 
