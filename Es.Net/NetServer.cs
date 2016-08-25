@@ -10,31 +10,31 @@ using Es.FwI;
 
 namespace Es.Net
 {
-    internal sealed class SystemServer : ISystemServer
+    internal sealed class NetServer : IRun
     {
         // Bare minimum of http/1.1 (this isn't a general http server, we're abusing HTTP to get across firewalls and assume the client is one of ours.) 
         // we assume keep-alive
 
-        private readonly IDictionary<int, ISystem> _systems;
+        private readonly IDictionary<int, ISystemServer> _systemServers;
         private readonly IPAddress _ip;
         private readonly Action<string> _log;
         private readonly ushort _port;
         private readonly IIdGenerator _idGenerator;
 
-        public SystemServer(
+        public NetServer(
             IPAddress ip, 
             ushort port, 
             Action<string> log, 
             IIdGenerator idGenerator, 
-            IEnumerable<ISystem> systems)
+            IEnumerable<ISystemServer> systems)
         {
             _ip = ip;
             _port = port;
-            _systems = new Dictionary<int, ISystem>();
+            _systemServers = new Dictionary<int, ISystemServer>();
             _idGenerator = idGenerator;
 
             foreach(var system in systems)
-                _systems[system.SystemNumber] = system;
+                _systemServers[system.Number] = system;
 
             _log = log ?? (_ => { });
         }
@@ -267,9 +267,9 @@ namespace Es.Net
                     var systemNumber = ByteBuffer.ReadInt(requestByteBuffer);
                     var requestNumber = ByteBuffer.ReadInt(requestByteBuffer);
 
-                    ISystem system;
+                    ISystemServer systemServer;
 
-                    if (!_systems.TryGetValue(systemNumber, out system))
+                    if (!_systemServers.TryGetValue(systemNumber, out systemServer))
                     {
                         await BadRequest(remoteSocket, responseBufferList, sendArgs, sendAwaitable);
                         return;
@@ -290,7 +290,7 @@ namespace Es.Net
                     ByteBuffer.WriteUlong(responseByteBuffer, commandInstanceId.Ulongs[0]);
                     ByteBuffer.WriteUlong(responseByteBuffer, commandInstanceId.Ulongs[1]);
 
-                    tasks.Add(system.ProcessCommand(callerId, sessionId, commandInstanceId, pbb, token).Background());
+                    tasks.Add(systemServer.ProcessCommand(callerId, sessionId, commandInstanceId, pbb, token).Background());
                 }
 
                 // salt = ByteBuffer.ReadUlong(requestByteBuffer);
@@ -304,7 +304,7 @@ namespace Es.Net
                 for (var i = 0; i < commandsToFollow; ++i)
                     ByteBuffer.EndPeelPacket(pbbs[i]);
 
-                foreach (var system in _systems)
+                foreach (var system in _systemServers)
                 {
                     tasks.Add(
                         system.Value.GetStateWriter(lastEventIdSeen, callerId)

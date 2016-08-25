@@ -88,7 +88,7 @@ namespace Es.Net.Test
         [Test]
         public void Test()
         {
-            ISystemServer sc = new SystemServer(IPAddress.Any, 666, Console.WriteLine, Default.IdGenerator,
+            ISystemServer sc = new NetServer(IPAddress.Any, 666, Console.WriteLine, Default.IdGenerator,
                 new ISystem[] {new Echo()});
             var cts = new CancellationTokenSource();
             var sct = sc.Run(cts.Token);

@@ -2,15 +2,17 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 using Es.Fw;
 using Es.FwI;
 
 namespace Es.Net
 {
-    internal sealed class SystemClient : ISystemClient
+    // need to put some thought into why we have client/server as separate parts ...
+    internal sealed class NetClient : IRun
     {
-        // designed for use on .net 2.0. (i.e. compatible with Unity5)
-        private readonly IDictionary<int, ISystem> _systems;
+        private readonly IDictionary<int, ISystemClient> _systemsClients;
         private readonly Action<string> _log;
         private readonly IPEndPoint _destinationEndPoint;
         private readonly int _autoDisconnectCount;
@@ -70,19 +72,19 @@ namespace Es.Net
         private int _sendState = SendState.Idle;
         private int _receiveState = SendState.Idle;
 
-        public SystemClient(
+        public NetClient(
             IPAddress ip,
             ushort port, 
             int autoDisconnectCount,
             Action<string> log,
-            IEnumerable<ISystem> systems)
+            IEnumerable<ISystemClient> systemClients)
         {
             _autoDisconnectCount = autoDisconnectCount;
             _log = log ?? (_ => { });
-            _systems = new Dictionary<int, ISystem>();
+            _systemsClients = new Dictionary<int, ISystemClient>();
 
-            foreach (var system in systems)
-                _systems[system.SystemNumber] = system;
+            foreach (var systemClient in systemClients)
+                _systemsClients[systemClient.Number] = systemClient;
 
             _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { Blocking = false };
             _destinationEndPoint = new IPEndPoint(ip, port);
@@ -208,6 +210,11 @@ namespace Es.Net
         public void ScheduleSend(int systemNumber, int requestNumber, Action<ByteBuffer> writer)
         {
             _deferredSends.Add(new DeferredSendData(systemNumber,requestNumber,writer));
+        }
+
+        public Task Run(CancellationToken token)
+        {
+            throw new NotImplementedException();
         }
     }
 }
